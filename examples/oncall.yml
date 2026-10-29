@@ -1,0 +1,94 @@
+# On-call agent for when you're on leave (demo: github.com/sushmareshamwala/oncall-agent-demo)
+# Every 15 minutes: check SITE_URL. If it's down: open one "incident" issue, then run the Claude Code
+# GitHub Action to find the cause, push a small fix to a new branch, open a PR and comment on the issue.
+# Claude never merges: protect your default branch with a ruleset that requires 1 approving review.
+# Setup (README.md): copy this file to .github/workflows/oncall.yml in YOUR repo · install the Claude GitHub App ·
+# secret ANTHROPIC_API_KEY · variable SITE_URL. (It lives in examples/ here so it never runs in this demo repo.)
+name: oncall
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"   # every 15 min, off the busy top of the hour
+  workflow_dispatch:
+
+permissions: {}
+concurrency: { group: oncall, cancel-in-progress: false }
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      down: ${{ steps.probe.outputs.down }}
+      code: ${{ steps.probe.outputs.code }}
+    steps:
+      - id: probe
+        env: { SITE_URL: "${{ vars.SITE_URL }}" }
+        run: |
+          if [ -z "$SITE_URL" ]; then
+            echo "::warning::SITE_URL is not set (Settings > Secrets and variables > Actions > Variables)"
+            echo "down=false" >> "$GITHUB_OUTPUT"; echo "code=000" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          code=$(curl -sS -L -o /dev/null -w '%{http_code}' --max-time 20 \
+                 --retry 2 --retry-delay 10 --retry-all-errors "$SITE_URL" || true)
+          code=${code: -3}; code=${code:-000}
+          if [ "$code" -ge 200 ] && [ "$code" -lt 400 ]; then down=false; else down=true; fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "down=$down" >> "$GITHUB_OUTPUT"
+
+  agent:
+    needs: check
+    if: needs.check.outputs.down == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read   # UNCONFIRMED in docs (examples use write); source pushes with the App token
+      issues: write    # gh label/issue create below (GITHUB_TOKEN)
+      id-token: write  # OIDC exchange for the Claude GitHub App token
+    steps:
+      - id: issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SITE_URL: ${{ vars.SITE_URL }}
+          CODE: ${{ needs.check.outputs.code }}
+        run: |
+          gh label create incident -R "$GITHUB_REPOSITORY" --color B60205 --force
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label incident --state open --json number --jq length)
+          if [ "$open" != "0" ]; then echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          url=$(gh issue create -R "$GITHUB_REPOSITORY" --label incident \
+            --title "Site down: HTTP $CODE" \
+            --body "Check of $SITE_URL returned HTTP $CODE at $(date -u +%FT%TZ). Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID")
+          echo "number=${url##*/}" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - if: steps.issue.outputs.skip == 'false'
+        uses: actions/checkout@v6
+        with: { fetch-depth: 20 }
+
+      - if: steps.issue.outputs.skip == 'false'
+        run: git checkout -b "oncall/issue-${{ steps.issue.outputs.number }}"
+
+      - if: steps.issue.outputs.skip == 'false'
+        uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            You are on call for ${{ github.repository }}. The site ${{ vars.SITE_URL }}
+            failed its health check (HTTP ${{ needs.check.outputs.code }}).
+            Incident: issue #${{ steps.issue.outputs.number }}. You are on branch
+            oncall/issue-${{ steps.issue.outputs.number }} (base: ${{ github.ref_name }}).
+
+            1. Investigate recent commits (git log -20 --stat, git show, git diff) and the code that serves the site.
+            2. Only if a change in this repo plausibly caused the outage: make the smallest fix that
+               restores the site (no refactors, no new dependencies). git add + git commit, push with exactly
+               `git push -u origin HEAD`, then run `gh pr create --base ${{ github.ref_name }}
+               --head oncall/issue-${{ steps.issue.outputs.number }} --title "..." --body "..."`;
+               the body explains cause and fix and ends with "Fixes #${{ steps.issue.outputs.number }}".
+            3. Always finish with `gh issue comment ${{ steps.issue.outputs.number }} --body "..."`: likely cause,
+               evidence (commit SHAs, files), the PR link, or why no code fix applies (e.g. host/DNS outage).
+
+            Rules: never merge, approve or close anything; never push to ${{ github.ref_name }};
+            never read, print or change secrets, .env files or .github/. If unsure, only comment.
+          claude_args: |
+            --max-turns 15
+            --allowedTools "Read,Glob,Grep,Edit,Write,Bash(git log *),Bash(git show *),Bash(git diff *),Bash(git status),Bash(git add *),Bash(git commit *),Bash(git push -u origin HEAD),Bash(gh pr create *),Bash(gh issue comment *)"
+            --disallowedTools "Bash(gh pr merge *),Edit(./.github/**),Write(./.github/**),Read(./.env*)"

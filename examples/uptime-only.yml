@@ -1,0 +1,22 @@
+# Uptime check only (no AI): copy to .github/workflows/uptime.yml if you just want an alert.
+# Every 15 min it opens your site; if that fails, it opens an issue labelled "incident",
+# and the GitHub mobile app notifies you. Needs the variable SITE_URL and the label "incident".
+name: uptime
+on:
+  schedule:
+    - cron: "7,22,37,52 * * * *"
+  workflow_dispatch:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    permissions: { issues: write }
+    steps:
+      - env:
+          SITE_URL: ${{ vars.SITE_URL }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          curl -fsS -L -o /dev/null --max-time 20 --retry 2 --retry-delay 10 --retry-all-errors "$SITE_URL" && exit 0
+          open=$(gh issue list -R "$GITHUB_REPOSITORY" --label incident --state open --json number --jq length)
+          [ "$open" != "0" ] && exit 0
+          gh issue create -R "$GITHUB_REPOSITORY" --label incident --title "Site down" --body "Check of $SITE_URL failed at $(date -u +%FT%TZ)"
